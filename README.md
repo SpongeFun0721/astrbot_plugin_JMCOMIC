@@ -2,6 +2,8 @@
 
 > 适用于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的禁漫天堂（JMComic）插件，支持通过指令搜索、下载漫画（自动合并成 PDF 发送）、查看排行榜和标签。
 
+> 本项目 Fork 自原作者 iamfromchangsha 的 [astrbot_plugin_JMCOMIC](https://github.com/iamfromchangsha/astrbot_plugin_JMCOMIC)，在此基础上进行了 PDF 合并发送、内存与并发调优等改进。
+
 
 ## ✨ 功能特性
 
@@ -145,7 +147,7 @@ data/plugins/astrbot_plugin_JMCOMIC/
 ## 🛠 开发者信息
 
 - **插件名称**：jm
-- **原作者**：iamfromchangsha
+- **原作者**：[iamfromchangsha](https://github.com/iamfromchangsha/astrbot_plugin_JMCOMIC)
 - **作者**：SpongeFun
 - **版本**：1.2.0
 
