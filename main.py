@@ -1,419 +1,382 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
-import astrbot.api.message_components as Comp
-import jmcomic
-from jmcomic import *
-import re
-import os
-import time
-import shutil
+"""AstrBot 禁漫天堂（JMComic）插件：下载本子 → 合并为 PDF → 发送给用户。
+
+下载与 PDF 合并在独立子进程（jm_worker.py）里执行，子进程自带内存上限：
+某本本子再大也只会终止那一次下载，不会拖垮 AstrBot。取消（/jm 暂停）
+就是杀子进程，立即生效。
+"""
+
 import asyncio
-import logging
-import yaml  # 提前导入，避免函数内重复导入
-import zipfile
-import random
-from xml.etree.ElementTree import Element, SubElement, tostring
-from xml.dom.minidom import parseString
+import hashlib
+import os
+import re
+import shutil
+import sys
+
+import yaml
+from jmcomic import JmOption
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import File
+from astrbot.api.star import Context, Star, register
+
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+OPTION_FILE = os.path.join(PLUGIN_DIR, "option.yml")
+WORKER_FILE = os.path.join(PLUGIN_DIR, "jm_worker.py")
+
+# 生成的 PDF 超过这个大小就不发送（平台对机器人发送的文件有大小上限）
+MAX_PDF_MB = 100
+# 单次下载硬超时：超过按失败终止，防止锁被一次卡死的下载永久占住
+DOWNLOAD_TIMEOUT_SEC = 3600
+
+# user_id -> 正在运行的下载子进程
+_DOWNLOAD_PROCS: dict[str, asyncio.subprocess.Process] = {}
+# user_id -> 下载互斥锁，防止同一用户并发下载互相覆盖文件
+_USER_LOCKS: dict[str, asyncio.Lock] = {}
+# user_id -> 用户已请求暂停，用于把退出码区分成"取消"而不是"失败"
+_PAUSE_REQUESTED: set[str] = set()
 
 
-logger = logging.getLogger("jmcomic_plugin")
+def extract_integers(text: str) -> list[str]:
+    """提取文本里的整数（保留原始写法，用于本子 ID）。"""
+    return re.findall(r"-?\b\d+\b", text)
 
-# 全局暂停标识字典：key=用户ID，value=是否暂停（bool），实现多用户隔离
-JM_PAUSE_FLAG = {}
 
-def extract_numbers(text):
-    # 正则表达式匹配整数、浮点数、负数
-    pattern = r'-?\d+\.?\d*'
-    matches = re.findall(pattern, text)
-    # 转换为数字类型（int 或 float）
-    numbers = []
-    for match in matches:
-        if '.' in match:
-            numbers.append(float(match))
-        else:
-            numbers.append(int(match))
-    return numbers
+def extract_page_number(message_str: str, default: int = 1) -> int:
+    """把消息里最后一个整数当作页码。"""
+    numbers = re.findall(r"\d+", message_str)
+    if not numbers:
+        return default
+    page = int(numbers[-1])
+    return page if page > 0 else default
 
-def find_images_os(folder_path, extensions=None):
-    if extensions is None:
-        extensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.webp'}
-    extensions = {ext.lower() for ext in extensions}
-    
-    image_files = []
-    for root, dirs, files in os.walk(folder_path):
-        for file in files:
-            if os.path.splitext(file)[1].lower() in extensions:
-                full_path = os.path.join(root, file)
-                image_files.append(full_path)
-    
-    # 按文件名中的数字排序
-    def extract_number(filename):
-        # 提取文件名中的数字部分
-        basename = os.path.basename(filename)
-        numbers = re.findall(r'\d+', basename)
-        if numbers:
-            return int(numbers[0])  # 返回第一个数字
-        return 0  # 如果没有找到数字，则返回0
-    
-    image_files.sort(key=extract_number)
-    return image_files
 
-def extract_integers(text):
-    pattern = r'-?\b\d+\b'
-    matches = re.findall(pattern, text)
-    return [str(match) for match in matches]
+def split_keyword_and_page(message_str: str, command: str) -> tuple[str, int]:
+    """把 "jms 全彩 2" 拆成 ("全彩", 2)：去掉命令本身，末尾整数是页码。
 
-def clear_folder(folder_path):
-    if not os.path.exists(folder_path):
-        print(f"警告: 路径不存在 - {folder_path}")
+    关键词里的数字不会被删掉，"催眠術2" 这类关键词可以正常搜索。
+    """
+    text = message_str.strip()
+    if text[: len(command)].lower() == command.lower():
+        text = text[len(command) :].strip()
+
+    match = re.search(r"(?:^|\s)(\d+)$", text)
+    if match and match.start() > 0:
+        return text[: match.start()].strip(), max(int(match.group(1)), 1)
+    return text, 1
+
+
+def safe_user_key(user_id: str) -> str:
+    """把平台传来的 sender id 转成安全的目录名（同一个人始终对应同一个目录）。"""
+    raw = str(user_id)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+    readable = re.sub(r"[^0-9A-Za-z_.-]", "_", raw)[:48] or "user"
+    return f"{readable}_{digest}"
+
+
+def get_user_download_dir(user_id: str) -> str:
+    """每个用户一个独立的临时下载目录。"""
+    path = os.path.join(PLUGIN_DIR, "download", safe_user_key(user_id))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def prepare_download_dir(path: str) -> None:
+    """清空临时目录。
+
+    调用点保证此刻没有下载在写这个目录：下载任务开始时先清一次，
+    下载结束后再清一次，不在下载过程中删文件。
+    """
+    if not os.path.isdir(path):
+        os.makedirs(path, exist_ok=True)
         return
 
-    if not os.path.isdir(folder_path):
-        raise ValueError(f"提供的路径不是文件夹: {folder_path}")
-
-    for item in os.listdir(folder_path):
-        item_path = os.path.join(folder_path, item)
+    for name in os.listdir(path):
+        target = os.path.join(path, name)
         try:
-            if os.path.isfile(item_path) or os.path.islink(item_path):
-                os.unlink(item_path)
-            elif os.path.isdir(item_path):
-                shutil.rmtree(item_path)
-        except Exception as e:
-            print(f"无法删除 {item_path}: {e}")
+            if os.path.isdir(target) and not os.path.islink(target):
+                shutil.rmtree(target)
+            else:
+                os.remove(target)
+        except OSError as e:
+            logger.warning(f"清理临时文件失败 {target}: {e}")
 
-def get_user_download_dir(user_id):
-    """
-    为每个用户生成独立的下载目录路径
-    """
-    base_dir = "./data/plugins/astrbot_plugin_jmcomic"
-    user_dir = os.path.join(base_dir, "download", user_id)
-    os.makedirs(user_dir, exist_ok=True)
-    return user_dir
 
-def create_comic_info_xml(title="Default Title", author="Unknown", tags=None):
-    """
-    创建包含标签的ComicInfo.xml字符串
-    """
-    comicinfo = Element('ComicInfo')
-    title_elem = SubElement(comicinfo, 'Title')
-    title_elem.text = title
-    author_elem = SubElement(comicinfo, 'Writer')
-    author_elem.text = author
-    
-    if tags:
-        tags_elem = SubElement(comicinfo, 'Tags')  # 使用'Tags'元素来存储标签
-        tags_elem.text = ", ".join(tags)
-    
-    rough_string = tostring(comicinfo, 'utf-8')
-    reparsed = parseString(rough_string)
-    return reparsed.toprettyxml(indent="  ")
+def find_generated_pdf(directory: str, album_id: str) -> str | None:
+    """找到 img2pdf 插件生成的 PDF：优先 {album_id}.pdf，否则取第一个 PDF。"""
+    if not os.path.isdir(directory):
+        return None
 
-def add_comic_info_to_folder(folder_path, title="Default Title", author="Unknown", tags=None):
-    """
-    在指定漫画文件夹中添加ComicInfo.xml
-    """
-    xml_content = create_comic_info_xml(title=title, author=author, tags=tags)
-    with open(os.path.join(folder_path, 'ComicInfo.xml'), 'w', encoding='utf-8') as f:
-        f.write(xml_content)
-    print(f"Added ComicInfo.xml to {folder_path}")
-def make_cbz(folder_path, output_filename):
-    """
-    将漫画文件夹压缩为CBZ文件
-    """
-    with zipfile.ZipFile(output_filename, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(folder_path):
-            for file in files:
-                full_path = os.path.join(root, file)
-                arcname = os.path.relpath(full_path, start=folder_path)
-                zf.write(full_path, arcname=arcname)
-    print(f"Created {output_filename}")
+    expected = os.path.join(directory, f"{album_id}.pdf")
+    if os.path.isfile(expected):
+        return expected
 
-def process_comics(main_folder,albumtags,albumauthor):
-    """
-    遍历主文件夹中的所有漫画文件夹，并为每个文件夹创建CBZ文件
-    """
-    for subdir in os.listdir(main_folder):
-        folder_path = os.path.join(main_folder, subdir)
-        if os.path.isdir(folder_path):
-            title = subdir  # 使用文件夹名称作为漫画标题
-            author = albumauthor
-            tags = albumtags  # 根据需要修改标签
-            
-            add_comic_info_to_folder(folder_path, title=title, author=author, tags=tags)
-            make_cbz(folder_path,  f"/opt/AstrBot/data/plugins_data/jmcomic/{subdir}.cbz")
+    for name in sorted(os.listdir(directory)):
+        if name.lower().endswith(".pdf"):
+            return os.path.join(directory, name)
+    return None
 
-def create_temp_option(option_file, user_download_dir):
-    """
-    创建临时配置文件，将下载目录指向用户的独立目录
-    """
-    # 读取原始配置
-    with open(option_file, 'r', encoding='utf-8') as f:
-        option_data = yaml.safe_load(f)
-    
-    # 修改下载目录
-    option_data['dir_rule']['base_dir'] = user_download_dir
-    
-    # 创建临时配置文件
-    temp_option_file = os.path.join(user_download_dir, "temp_option.yml")
-    with open(temp_option_file, 'w', encoding='utf-8') as f:
-        yaml.dump(option_data, f, allow_unicode=True)
-    
-    return temp_option_file
 
-@register("jm", "iamfromchangsha", "一个简单的插件", "1.0.0")
+def load_option_dict() -> dict:
+    """读取插件目录下自己的 option.yml（账号、线程等配置的唯一来源）。"""
+    with open(OPTION_FILE, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"option.yml 内容不是有效的配置: {OPTION_FILE}")
+    return data
+
+
+def build_query_client():
+    """按 option.yml（含登录信息）构建客户端，供搜索 / 标签 / 排行榜使用。"""
+    return JmOption.construct(load_option_dict()).new_jm_client()
+
+
+def search_albums(keyword: str, page: int) -> list[tuple[str, str]]:
+    """搜索本子，返回 [(id, 标题), ...]。"""
+    page_result = build_query_client().search_site(search_query=keyword, page=page)
+    return [(album_id, title) for album_id, title in page_result]
+
+
+def fetch_ranking(monthly: bool, page: int) -> list[tuple[str, str]]:
+    """获取月/周排行榜，返回 [(id, 标题), ...]。"""
+    client = build_query_client()
+    page_result = client.month_ranking(page=page) if monthly else client.week_ranking(page=page)
+    return [(album_id, title) for album_id, title in page_result]
+
+
+def fetch_album_meta(album_id: str) -> tuple[str, list[str], str]:
+    """按 ID 查本子的标题、标签、作者。"""
+    album = build_query_client().get_album_detail(album_id)
+    tags = list(album.tags) if album.tags else []
+    return album.title, tags, album.author or "Unknown Author"
+
+
+@register("jm", "SpongeFun", "禁漫天堂插件：下载本子并合并成 PDF 发送", "1.2.0")
 class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
-    
+
     @filter.command("jm")
     async def jm(self, event: AstrMessageEvent):
-        user_name = event.get_sender_name()
         user_id = event.get_sender_id()
+        # QQ 官方（群聊/单聊）不提供用户昵称，拿不到时统一用"你"兜底
+        user_name = event.get_sender_name() or "你"
         message_str = event.message_str.strip()
-        message_chain = event.get_messages()
-        logger.info(message_chain)
 
-        if re.match(r'^jm\s*暂停$', message_str, re.IGNORECASE):
-            JM_PAUSE_FLAG[user_id] = True
-            user_download_dir = get_user_download_dir(user_id)
-            clear_folder(user_download_dir)
-            yield event.plain_result(f"{user_name}，已暂停漫画发送并清除服务器下载文件！")
+        if re.fullmatch(r"jm\s*暂停", message_str, re.IGNORECASE):
+            yield event.plain_result(await self._pause_download(user_id, user_name))
             return
 
-        JM_PAUSE_FLAG[user_id] = False
-        
-        # --- 修改开始：参考上次建议 ---
-        original_message_for_display = message_str # 保存原始字符串用于显示
-        album_ids_from_input = extract_integers(message_str) # 提取ID列表
-
-        if not album_ids_from_input:
+        album_ids = extract_integers(message_str)
+        if not album_ids:
             yield event.plain_result(f"{user_name}, 未找到有效的数字ID，请检查输入。例如：/jm 123456")
-            return # 如果没有找到ID，直接返回
-        
-        album_id_to_search = album_ids_from_input[0] # 取第一个ID用于下载和后续查询
-        # --- 修改结束 ---
+            return
 
-        yield event.plain_result(f"{user_name}, 正在查找 [{album_id_to_search}] !") # 显示要下载的ID
-
-        # 为每个用户创建独立的下载目录
-        user_download_dir = get_user_download_dir(user_id)
-        clear_folder(user_download_dir)
-        try:
-            temp_option_file = create_temp_option(
-                "./data/plugins/astrbot_plugin_jmcomic/option.yml", 
-                user_download_dir
+        album_id = album_ids[0]
+        lock = _USER_LOCKS.setdefault(user_id, asyncio.Lock())
+        if lock.locked():
+            yield event.plain_result(
+                f"{user_name}，你还有一本正在下载，请等它结束，或发送 /jm 暂停 取消。"
             )
-            
-            option = jmcomic.create_option_by_file(temp_option_file)
-            # --- 修改：使用提取到的ID ---
-            jmcomic.download_album(album_id_to_search, option) 
-            
-            images = find_images_os(user_download_dir)
+            return
 
-            if JM_PAUSE_FLAG.get(user_id, False):
-                clear_folder(user_download_dir)
-                yield event.plain_result(f"{user_name}，已触发暂停，取消图片发送并清除文件！")
-                return
-            
-            yield event.plain_result(f"共找到 {len(images)} 张图片，按顺序发送：")
-            
-            for i, img in enumerate(images, 1):
-                if JM_PAUSE_FLAG.get(user_id, False):
-                    yield event.plain_result(f"{user_name}，已暂停图片发送，剩余{len(images)-i+1}张未发送！")
-                    break
-                yield event.image_result(img)
-                await asyncio.sleep(1)
+        async with lock:
+            user_dir = get_user_download_dir(user_id)
+            try:
+                yield event.plain_result(f"{user_name}, 正在查找 [{album_id}] !")
+                await asyncio.to_thread(prepare_download_dir, user_dir)
+                yield event.plain_result(
+                    f"{user_name}，开始下载 [{album_id}]，大本子需要几分钟，"
+                    f"期间可发送 /jm 暂停 取消。"
+                )
 
-            if JM_PAUSE_FLAG.get(user_id, False):
-                yield event.plain_result(f"{user_name}，未保存到komaga")
-            else:
-                # 现在 album_id_to_search 已经在函数作用域内定义了
-                subdir = os.listdir(user_download_dir)[0]
-                for subdir in os.listdir(user_download_dir):
-                    folder_path = os.path.join(user_download_dir, subdir)
-                    if os.path.isdir(folder_path):
-                        title = subdir 
+                # 下载 + 合并 PDF 全在子进程里跑：
+                # - 子进程自限内存（RLIMIT_AS），异常只损失本次下载
+                # - 取消 = 终止子进程，立即生效
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, WORKER_FILE, album_id, user_dir,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _DOWNLOAD_PROCS[user_id] = proc
+                try:
+                    _, stderr = await asyncio.wait_for(proc.communicate(), DOWNLOAD_TIMEOUT_SEC)
+                except asyncio.TimeoutError:
+                    _PAUSE_REQUESTED.discard(user_id)
+                    await self._kill(proc)
+                    yield event.plain_result(f"{user_name}，下载超过 1 小时，已强制终止。")
+                    return
 
-                yield event.plain_result(f"{user_name}，正在保存,{title}")
-                
-                client = JmOption.default().new_jm_client()
-                # --- 使用定义好的 album_id_to_search ---
-                page = client.search_site(search_query=album_id_to_search) 
-                album: JmAlbumDetail = page.single_album 
-                
-                if album is None:
-                    # 现在这一行不会报 NameError 了
-                    yield event.plain_result(f"{user_name}, 未能找到ID为 [{album_id_to_search}] 的本子。")
-                    return # 添加return，否则会继续执行下面的代码
+                if user_id in _PAUSE_REQUESTED:
+                    _PAUSE_REQUESTED.discard(user_id)
+                    yield event.plain_result(f"{user_name}，已暂停，本次下载取消。")
+                    return
 
-                # 注意：这里获取到的 tags 是一个列表，而 process_comics 期望的是一个列表
-                # 但您传入的是 join 后的字符串。需要调整。
-                album_tags_list = album.tags if album.tags else ['No Tags Found']
-                album_author_str = album.author if album.author else 'Unknown Author'
+                if proc.returncode != 0:
+                    err = (stderr or b"").decode("utf-8", "replace").strip()
+                    err = err[-500:] if err else f"退出码 {proc.returncode}"
+                    logger.error(f"用户{user_id}下载 {album_id} 失败：{err}")
+                    yield event.plain_result(f"{user_name}，下载失败：{err}")
+                    return
 
-                yield event.plain_result(f"{user_name}，正在保存,{title}")
-                # --- 传入标签列表和作者字符串 ---
-                process_comics(user_download_dir, album_tags_list, album_author_str) # 传入列表
+                pdf_path = await asyncio.to_thread(find_generated_pdf, user_dir, album_id)
+                if not pdf_path:
+                    yield event.plain_result(
+                        f"{user_name}，下载完成但没有生成 PDF，请查看机器人日志里 jm_worker 的输出。"
+                    )
+                    return
 
-                yield event.plain_result(f"{user_name}，已保存到komaga")
-        except Exception as e:
-            logger.error(f"用户{user_id}执行jm命令出错：{str(e)}")
-            yield event.plain_result(f"{user_name}，操作出错：{str(e)}")
-        finally:
-            clear_folder(user_download_dir)
-            if user_id in JM_PAUSE_FLAG:
-                del JM_PAUSE_FLAG[user_id]
+                size_mb = os.path.getsize(pdf_path) / 1024 / 1024
+                if size_mb > MAX_PDF_MB:
+                    yield event.plain_result(
+                        f"{user_name}，PDF 有 {size_mb:.1f} MB，超过 {MAX_PDF_MB} MB 上限，未发送。"
+                    )
+                    return
+
+                yield event.plain_result(f"{user_name}，PDF已生成 ({size_mb:.1f} MB)，正在发送...")
+                # 直接发文件并等它传完，之后才清理临时文件
+                await event.send(
+                    event.chain_result([File(name=f"{album_id}.pdf", file=pdf_path)])
+                )
+            except Exception as e:
+                logger.error(f"用户{user_id}执行jm命令出错：{e}", exc_info=True)
+                yield event.plain_result(f"{user_name}，操作出错：{e}")
+            finally:
+                _DOWNLOAD_PROCS.pop(user_id, None)
+                _PAUSE_REQUESTED.discard(user_id)
+                await asyncio.to_thread(prepare_download_dir, user_dir)
+
+        if not lock.locked():
+            _USER_LOCKS.pop(user_id, None)
+
+    async def _pause_download(self, user_id: str, user_name: str) -> str:
+        proc = _DOWNLOAD_PROCS.get(user_id)
+        if proc is None:
+            return f"{user_name}，当前没有正在进行的下载。"
+        _PAUSE_REQUESTED.add(user_id)
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+
+        # 子进程若卡在原生代码里收不到 SIGTERM，10 秒后升级为强杀
+        async def _escalate():
+            await asyncio.sleep(10)
+            if proc.returncode is None:
+                await self._kill(proc)
+
+        asyncio.create_task(_escalate())
+        return f"{user_name}，已暂停，正在停止本次下载并清理文件！"
+
+    @staticmethod
+    async def _kill(proc: asyncio.subprocess.Process) -> None:
+        try:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+        except ProcessLookupError:
+            pass
 
     @filter.command("jms")
     async def jms(self, event: AstrMessageEvent):
-        user_name = event.get_sender_name()
-        message_str = event.message_str
-        logger.info(f"Received command from {user_name}: {message_str}")
-        pages = int(extract_numbers(message_str)[0]) if extract_numbers(message_str) else 1
-        message_str = re.sub(r'\d', '', message_str)
-        yield event.plain_result(f"{user_name}, {message_str}这种题材实在是太涩啦!页面：{pages}")
-        client = JmOption.default().new_jm_client()
-        page: JmSearchPage = client.search_site(search_query=message_str, page=pages)
-        result = ""
-        for album_id, title in page:
-            result += f'[{album_id}]: {title}\n'
-        yield event.plain_result(result)
+        user_name = event.get_sender_name() or "你"
+        keyword, page = split_keyword_and_page(event.message_str, "jms")
+        if not keyword:
+            yield event.plain_result(f"{user_name}，请带上搜索关键词，例如：/jms 全彩 2")
+            return
 
-    # --- 新增：月排行榜 ---
+        yield event.plain_result(f"{user_name}, {keyword}这种题材实在是太涩啦!页面：{page}")
+        try:
+            albums = await asyncio.to_thread(search_albums, keyword, page)
+        except Exception as e:
+            logger.error(f"用户{event.get_sender_id()}执行jms命令出错：{e}", exc_info=True)
+            yield event.plain_result(f"{user_name}, 搜索出错：{e}")
+            return
+
+        if not albums:
+            yield event.plain_result(f"{user_name}，第 {page} 页没有搜到结果。")
+            return
+
+        yield event.plain_result("\n".join(f"[{aid}]: {title}" for aid, title in albums))
+
+    @filter.command("jmtag")
+    async def jmtag(self, event: AstrMessageEvent):
+        user_name = event.get_sender_name() or "你"
+        album_ids = extract_integers(event.message_str)
+        if not album_ids:
+            yield event.plain_result(f"{user_name}, 未找到有效的数字ID，请检查输入。例如：/jmtag 123456")
+            return
+
+        album_id = album_ids[0]
+        try:
+            title, tags, author = await asyncio.to_thread(fetch_album_meta, album_id)
+        except Exception as e:
+            logger.error(f"用户{event.get_sender_id()}执行jmtag命令出错：{e}", exc_info=True)
+            yield event.plain_result(f"{user_name}, 获取标签时发生错误：{e}")
+            return
+
+        tags_str = ", ".join(tags) if tags else "无标签"
+        yield event.plain_result(f"[{album_id}]:\n{title}\n作者: {author}\n标签: {tags_str}")
+
     @filter.command("jmmr")
     async def jm_monthly_ranking(self, event: AstrMessageEvent):
-        user_name = event.get_sender_name()
-        message_str = event.message_str
-        logger.info(f"Received monthly ranking request from {user_name}: {message_str}")
-        
-        # 尝试从消息中提取页码，默认为1
-        page_num_list = extract_numbers(message_str)
-        page_num = int(page_num_list[0]) if page_num_list and page_num_list[0] > 0 else 1
+        async for result in self._ranking(event, "月度排行榜", monthly=True):
+            yield result
 
-        yield event.plain_result(f"{user_name}，正在获取月度排行榜第 {page_num} 页...")
-
-        try:
-            client = JmOption.default().new_jm_client()
-            # 调用月排行榜API
-            page: JmCategoryPage = client.month_ranking(page=page_num)
-            
-            if not page:
-                 yield event.plain_result(f"{user_name}，未能获取到第 {page_num} 页的排行榜数据。")
-                 return
-
-            result = f"月度排行榜 第 {page_num} 页:\n"
-            for album_id, title in page:
-                result += f'[{album_id}]: {title}\n'
-            
-            yield event.plain_result(result.strip())
-
-        except Exception as e:
-            logger.error(f"用户{event.get_sender_id()}执行jmmr命令出错：{str(e)}")
-            yield event.plain_result(f"{user_name}，获取月度排行榜时发生错误: {str(e)}")
-    # --- 新增结束 ---
-
-    # --- 新增：周排行榜 ---
     @filter.command("jmwr")
     async def jm_weekly_ranking(self, event: AstrMessageEvent):
-        user_name = event.get_sender_name()
-        message_str = event.message_str
-        logger.info(f"Received weekly ranking request from {user_name}: {message_str}")
-        
-        # 尝试从消息中提取页码，默认为1
-        page_num_list = extract_numbers(message_str)
-        page_num = int(page_num_list[0]) if page_num_list and page_num_list[0] > 0 else 1
+        async for result in self._ranking(event, "周度排行榜", monthly=False):
+            yield result
 
-        yield event.plain_result(f"{user_name}，正在获取周度排行榜第 {page_num} 页...")
+    async def _ranking(self, event: AstrMessageEvent, name: str, monthly: bool):
+        user_name = event.get_sender_name() or "你"
+        page = extract_page_number(event.message_str)
+        yield event.plain_result(f"{user_name}，正在获取{name}第 {page} 页...")
 
         try:
-            client = JmOption.default().new_jm_client()
-            # 调用周排行榜API
-            page: JmCategoryPage = client.week_ranking(page=page_num)
-            
-            if not page:
-                 yield event.plain_result(f"{user_name}，未能获取到第 {page_num} 页的排行榜数据。")
-                 return
-
-            result = f"周度排行榜 第 {page_num} 页:\n"
-            for album_id, title in page:
-                result += f'[{album_id}]: {title}\n'
-            
-            yield event.plain_result(result.strip())
-
+            albums = await asyncio.to_thread(fetch_ranking, monthly, page)
         except Exception as e:
-            logger.error(f"用户{event.get_sender_id()}执行jmwr命令出错：{str(e)}")
-            yield event.plain_result(f"{user_name}，获取周度排行榜时发生错误: {str(e)}")
-    # --- 新增结束 ---
+            logger.error(f"用户{event.get_sender_id()}获取{name}出错：{e}", exc_info=True)
+            yield event.plain_result(f"{user_name}，获取{name}时发生错误：{e}")
+            return
 
-    # --- 新增：帮助命令 ---
+        if not albums:
+            yield event.plain_result(f"{user_name}，未能获取到第 {page} 页的排行榜数据。")
+            return
+
+        body = "\n".join(f"[{aid}]: {title}" for aid, title in albums)
+        yield event.plain_result(f"{name} 第 {page} 页:\n{body}")
+
     @filter.command("jmhelp")
     async def jm_help(self, event: AstrMessageEvent):
-        user_name = event.get_sender_name()
+        user_name = event.get_sender_name() or "你"
         help_text = f"""
 {user_name}，欢迎使用禁漫天堂插件！
 以下是可用的命令列表：
 
-/jm <ID>          - 下载指定ID的漫画，并发送图片。
-/jm 暂停          - 暂停当前正在进行的漫画下载和发送，并清理缓存。
-/jms <关键词> [页码] - 搜索指定关键词的漫画，默认第1页。
-/jmtag <ID>       - 查询指定ID漫画的标签。
-/jmmr [页码]      - 获取月度热门排行榜，默认第1页。
-/jmwr [页码]      - 获取周度热门排行榜，默认第1页。
+/jm <ID>          - 下载指定 ID 的本子，合并成 PDF 后发送。
+/jm 暂停          - 暂停当前正在进行的下载，并清理服务器上的临时文件。
+/jms <关键词> [页码] - 搜索本子，页码写在最后，默认第 1 页。
+/jmtag <ID>       - 查询指定 ID 本子的标签。
+/jmmr [页码]      - 获取月度热门排行榜，默认第 1 页。
+/jmwr [页码]      - 获取周度热门排行榜，默认第 1 页。
 /jmhelp           - 显示此帮助信息。
 
 注意：[] 表示可选参数。
         """.strip()
         yield event.plain_result(help_text)
-    # --- 新增结束 ---
 
-    @filter.command("jmtag")
-    async def jmtag(self, event: AstrMessageEvent):
-        user_name = event.get_sender_name()
-        original_message_str = event.message_str # 保存原始消息字符串
-        logger.info(f"Received command from {user_name}: {original_message_str}")
-        
-        # 提取数字，假设第一个数字就是要查询的album ID
-        album_ids = extract_integers(original_message_str)
-        
-        if not album_ids:
-            yield event.plain_result(f"{user_name}, 未找到有效的数字ID，请检查输入。例如：/jmtag 123456")
-            return
-            
-        album_id_to_search = album_ids[0] # 取第一个找到的数字作为ID
-        
-        # 不再修改原始message_str用于显示
-        yield event.plain_result(f"{user_name}, 查询本子 [{album_id_to_search}] 的标签!")
-
-        try:
-            client = JmOption.default().new_jm_client()
-            # 直接使用提取到的数字ID进行搜索
-            page = client.search_site(search_query=str(album_id_to_search)) # 确保传入字符串
-            # 使用正确的属性名 .single_album
-            album: JmAlbumDetail = page.single_album 
-
-            # 检查是否成功获取到album对象 (虽然按理说查ID应该能找到，但以防万一)
-            if album is None:
-                yield event.plain_result(f"{user_name}, 未能找到ID为 [{album_id_to_search}] 的本子。")
-                return
-
-            tags_str = ', '.join(album.tags) if album.tags else '无标签' # 将标签列表转为字符串
-            yield event.plain_result(f"[{album_id_to_search}]:\n{album.title}\n标签: {tags_str}") # 显示ID, 标题和标签
-            
-        except AttributeError as e:
-            if "'JmSearchPage' object has no attribute 'single_album'" in str(e):
-                # 这种情况理论上不应该发生在查ID时，除非ID无效
-                yield event.plain_result(f"{user_name}, 搜索结果不唯一或无效，无法获取详情。")
-            else:
-                logger.error(f"AttributeError in jmtag: {e}")
-                yield event.plain_result(f"{user_name}, 获取标签时发生错误 (AttributeError): {e}")
-        except Exception as e:
-            logger.error(f"用户{event.get_sender_id()}执行jmtag命令出错：{str(e)}")
-            yield event.plain_result(f"{user_name}, 获取标签时发生错误: {str(e)}")   
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
-        # 插件销毁时清空所有暂停标识
-        JM_PAUSE_FLAG.clear()
+        """插件被卸载/停用时调用：终止还在跑的下载子进程。"""
+        for user_id, proc in list(_DOWNLOAD_PROCS.items()):
+            _PAUSE_REQUESTED.add(user_id)
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+        _DOWNLOAD_PROCS.clear()
+        _USER_LOCKS.clear()
+        _PAUSE_REQUESTED.clear()

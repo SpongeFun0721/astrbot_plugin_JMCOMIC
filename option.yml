@@ -1,9 +1,14 @@
 download:
   image:
-    suffix: .png # 该配置用于把下载的图片转为png格式
+    # JM 原生图是 webp，img2pdf 无法直接嵌入 webp，但可以原样嵌入 jpg（体积近似无损传递）。
+    # 此前的 .png 会对每一页做 PIL 解码 + PNG 重编码，是内存和 CPU 的最大来源，
+    # 实测能把 2 vCPU 的机器整个拖死，不要改回去。
+    suffix: .jpg
   threading:
-    image: 5
-    photo: 2
+    # 为 2 vCPU / 2GB 内存的部署环境下调：每张图解码+重编码的内存占用是有界的，
+    # 但 5 线程并发会把峰值叠高，2/1 足够用且更稳。
+    image: 2
+    photo: 1
 
 plugins: # 插件配置项
   after_init: # 在after_init事件时自动执行插件
@@ -11,8 +16,10 @@ plugins: # 插件配置项
       kwargs: # 下面是给插件的参数 (kwargs)，由插件类自定义
         username: jmzhuanyonghao # 禁漫帐号
         password: jmzhuanyonghao # 密码
+# 注意：after_album 的 img2pdf 配置由 jm_worker.py 在下载时注入
+# （输出目录要按用户隔离，写死在这里会失效），这里不需要再配置。
+
 dir_rule:
-  # base_dir: 根目录。
-  # 此配置也支持引用环境变量，例如
-  # base_dir: ${JM_DIR}/下载文件夹/
-  base_dir: ./data/plugins/astrbot_plugin_jmcomic/download # 根目录
+  # 本子下载位置。下载时会被 jm_worker.py 覆盖成当前用户的独立临时目录，
+  # 这里填的值只影响不使用用户目录的场景。
+  base_dir: ./download
